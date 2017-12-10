@@ -1,0 +1,299 @@
+前面已经说过，console线程负责从控制台读取输入，从Command RegexTrie中取出命令去执行，而其中最重要的就是run命令，需要要运行的命令装载并解析并添加到CommandScheduler的命令调度队列中。
+
+###1.命令
+命令解析，简单的说，就是解析其中的配置文件生成配置configuration，然后装载成一个command对象。比如：`run cts.xml`这个命令，在解析的时候就是去查找cts.xml文件，拿到其中配置的组件的所指定的内容，这个内容一般是各个组件的实现类，将这个实现类保存，后面命令执行的时候使用。
+
+###2.组件
+**组件**的概念：基础框架是通过一系列组件来组成的，比如CommandScheduler就是GlobalConfiguration中的一个组件，也就是说，框架定义了一系列功能接口，通过这些接口的实现类，协作之后就能完成框架的功能，这些组件主要有命令的解析，调度，执行，设备管理，log的收集等等。基础框架已经提供了默认的组件实现，但是当需要真正的执行测试的时候，就需要跑自己的case，此时就需要使用自己的配置，不过自己不仅仅能定义测试case，还可以重定义组件。而解析配置文件的作用就是为了**用xml文件中自定义的组件替换掉默认的组件**。
+
+支持的全局组件的定义在GlobalConfiguration中，单个命令的组件的定义在Configuration中。
+
+###3.开始解析
+在Console线程往CommandScheduler中addCommand时就开始了配置文件的解析
+``` java
+private boolean internalAddCommand(String[] args, long totalExecTime, String cmdFilePath)
+        throws ConfigurationException {
+    assertStarted();
+    // 这一行直接就完成了配置文件的解析，还是在ConfigurationFactory中
+    IConfiguration config = getConfigFactory().createConfigurationFromArgs(args, null,
+            getKeyStoreClient());
+    // helpMode特殊处理，直接打印helpList
+    if (config.getCommandOptions().isHelpMode()) {
+        getConfigFactory().printHelpForConfig(args, true, System.out);
+    // help all mode，详细打印所有的helplist
+    } else if (config.getCommandOptions().isFullHelpMode()) {
+        getConfigFactory().printHelpForConfig(args, false, System.out);
+    } else if (config.getCommandOptions().isJsonHelpMode()) {
+        try {
+            // Convert the JSON usage to a string (with 4 space indentation) and print to stdout
+            System.out.println(config.getJsonCommandUsage().toString(4));
+        } catch (JSONException e) {
+            CLog.logAndDisplay(LogLevel.ERROR, "Failed to get json command usage: %s", e);
+        }
+    } else if (config.getCommandOptions().isDryRunMode()) {
+        config.validateOptions();
+        String cmdLine = QuotationAwareTokenizer.combineTokens(args);
+        CLog.d("Dry run mode; skipping adding command: %s", cmdLine);
+        if (config.getCommandOptions().isNoisyDryRunMode()) {
+            System.out.println(cmdLine.replace("--noisy-dry-run", ""));
+            System.out.println("");
+        }
+    } else {
+        config.validateOptions();
+        if (config.getCommandOptions().runOnAllDevices()) {
+            // 如果是所有设备都运行则就为所有的device添加命令           
+            addCommandForAllDevices(totalExecTime, args, cmdFilePath);
+        } else {
+            // 封装命令
+            CommandTracker cmdTracker = createCommandTracker(args, cmdFilePath);
+            cmdTracker.incrementExecTime(totalExecTime);
+            // 生成执行命令
+            ExecutableCommand cmdInstance = createExecutableCommand(cmdTracker, config, false);
+            // 添加命令到队列，等待被调度
+            addExecCommandToQueue(cmdInstance, 0);
+        }
+        return true;
+    }
+    return false;
+}
+```
+ConfigurationFactory中获取配置
+``` java
+// 这个方法作用非常强大，完成了参数的解析以及到对象封装
+private IConfiguration internalCreateConfigurationFromArgs(String[] arrayArgs,
+        List<String> optionArgsRef, IKeyStoreClient keyStoreClient)
+        throws ConfigurationException {
+    if (arrayArgs.length == 0) {
+        throw new ConfigurationException("Configuration to run was not specified");
+    }
+    final List<String> listArgs = new ArrayList<>(Arrays.asList(arrayArgs));
+    // 拿到第一个参数，对于输入run cts.xml，前面已经把run取出，因此这里拿到的就是cts.xml
+    final String configName = listArgs.remove(0);
+    final ConfigurationXmlParserSettings parserSettings = new ConfigurationXmlParserSettings();
+    final ArgsOptionParser templateArgParser = new ArgsOptionParser(parserSettings);
+    if (keyStoreClient != null) {
+        templateArgParser.setKeyStore(keyStoreClient);
+    }
+    optionArgsRef.addAll(templateArgParser.parseBestEffort(listArgs));
+    // 重点在这里，一个xml文件对应与一个ConfigurationDef对象
+    ConfigurationDef configDef = getConfigurationDef(configName, false,
+            parserSettings.templateMap);
+    if (!parserSettings.templateMap.isEmpty()) {
+        // remove the bad ConfigDef from the cache.
+        for (ConfigId cid : mConfigDefMap.keySet()) {
+            if (mConfigDefMap.get(cid) == configDef) {
+                CLog.d("Cleaning the cache for this configdef");
+                mConfigDefMap.remove(cid);
+                break;
+            }
+        }
+        throw new ConfigurationException(String.format("Unused template:map parameters: %s",
+                parserSettings.templateMap.toString()));
+    }
+    // 每个配置文件对应与一个ConfigurationDef
+    // 配置文件中的内容封装成对象之后，用这个对象生成Configuration
+    return configDef.createConfiguration();
+}
+```
+
+获取ConfigurationDef对象
+``` java
+public ConfigurationDef getConfigurationDef(String name, Map<String, String> templateMap)
+        throws ConfigurationException {
+    String configName = name;
+    // 确认这个xml文件的路径以及格式
+    if (!isBundledConfig(name)) {
+        configName = getAbsolutePath(null, name);
+        File configFile = new File(configName);
+        if (!configFile.exists()) {
+            configFile = getTestCaseConfigPath(name);
+            if (configFile != null) {
+                configName = configFile.getAbsolutePath();
+            }
+        }
+    }
+    final ConfigId configId = new ConfigId(name, templateMap);
+    // 从map中获取
+    ConfigurationDef def = mConfigDefMap.get(configId);
+    if (def == null || def.isStale()) {
+        def = new ConfigurationDef(configName);
+        // 填充ConfigurationDef的信息
+        loadConfiguration(configName, def, templateMap);
+        mConfigDefMap.put(configId, def);
+    } else {
+        if (templateMap != null) {
+            // Clearing the map before returning the cached config to
+            // avoid seeing them as
+            // unused.
+            CLog.d("Using cached configuration, ensuring map is clean.");
+            templateMap.clear();
+        }
+    }
+    return def;
+}
+```
+loadConfiguration -- 完成xml的sax解析
+``` java
+void loadConfiguration(String name, ConfigurationDef def, Map<String, String> templateMap)
+        throws ConfigurationException {
+    Log.d(LOG_TAG, String.format("Loading configuration '%s'", name));
+    BufferedInputStream bufStream = getConfigStream(name);
+    // 这个parser其实就是个解析的，使用的是sax解析
+    // 具体解析的细节这里不介绍了，可以去看具体的源码
+    // 主要逻辑还是对本身支持的一些标签的内容进行提取
+    ConfigurationXmlParser parser = new ConfigurationXmlParser(this);
+    // 开始解析
+    parser.parse(def, name, bufStream, templateMap);
+    // Track local config source files
+    if (!isBundledConfig(name)) {
+        def.registerSource(new File(name));
+    }
+}
+```
+在这个地方解析完成之后，也就拿到了这个配置文件的ConfigurationDef对象，最后就是`configDef.createConfiguration();`
+``` java
+IConfiguration createConfiguration() throws ConfigurationException {
+    // 这里第一步就是创建一个Configuration
+    // Configuration的初始化中的工作很多，但是其实类似GlobalConfiguration
+    // 主要是默认组件的初始化以及添加
+    // 维护了一个map，key是组件的string，value是组件对应的class的name
+    IConfiguration config = new Configuration(getName(), getDescription());
+    List<IDeviceConfiguration> deviceObjectList = new ArrayList<IDeviceConfiguration>();
+    IDeviceConfiguration defaultDeviceConfig =
+            new DeviceConfigurationHolder(DEFAULT_DEVICE_NAME);
+    if (!mMultiDeviceMode) {
+        deviceObjectList.add(defaultDeviceConfig);
+    } else {
+        for (String name : mExpectedDevices) {
+            deviceObjectList.add(new DeviceConfigurationHolder(name));
+        }
+    }
+    // mObjectClassMap这个map是一个很重要的角色，因为它在前面xml解析的时候将标签以及这个标签对应的value存储起来了
+    // 也就是说，key是组件的string，value是自定义的组件的class的实例对象
+    // 这里遍历整个map，完成默认的组件的替换工作
+    for (Map.Entry<String, List<ConfigObjectDef>> objClassEntry : mObjectClassMap.entrySet()) {
+        List<Object> objectList = new ArrayList<Object>(objClassEntry.getValue().size());
+        String entryName = objClassEntry.getKey();
+        boolean shouldAddToFlatConfig = true;
+        for (ConfigObjectDef configDef : objClassEntry.getValue()) {
+            // 这里通过反射创建类的实例
+            Object configObject = createObject(objClassEntry.getKey(), configDef.mClassName);
+            Matcher matcher = null;
+            if (mMultiDeviceMode) {
+                matcher = MULTI_PATTERN.matcher(entryName);
+            }
+            if (mMultiDeviceMode && matcher.find()) {
+                // If we find the device namespace, fetch the matching device or create it if
+                // it doesn't exists.
+                IDeviceConfiguration multiDev = null;
+                shouldAddToFlatConfig = false;
+                for (IDeviceConfiguration iDevConfig : deviceObjectList) {
+                    if (matcher.group(1).equals(iDevConfig.getDeviceName())) {
+                        multiDev = iDevConfig;
+                        break;
+                    }
+                }
+                if (multiDev == null) {
+                    multiDev = new DeviceConfigurationHolder(matcher.group(1));
+                    deviceObjectList.add(multiDev);
+                }
+                // We reference the original object to the device and not to the flat list.
+                multiDev.addSpecificConfig(configObject);
+                multiDev.addFrequency(configObject, configDef.mAppearanceNum);
+            } else {
+                if (Configuration.doesBuiltInObjSupportMultiDevice(entryName)) {
+                    defaultDeviceConfig.addSpecificConfig(configObject);
+                    defaultDeviceConfig.addFrequency(configObject, configDef.mAppearanceNum);
+                } else {
+                    // Only add to flat list if they are not part of multi device config.
+                    objectList.add(configObject);
+                }
+            }
+        }
+        if (shouldAddToFlatConfig) {
+            // 把反射好的组件的instance添加到configuration的组件map中
+            config.setConfigurationObjectList(entryName, objectList);
+        }
+    }
+    // We always add the device configuration list so we can rely on it everywhere
+    config.setConfigurationObjectList(Configuration.DEVICE_NAME, deviceObjectList);
+    config.injectOptionValues(mOptionList);
+    return config;
+}
+```
+在Configuration中
+``` Java
+public synchronized void setConfigurationObjectList(String typeName, List<?> configList)
+        throws ConfigurationException {
+    if (configList == null) {
+        throw new IllegalArgumentException("configList cannot be null");
+    }
+    // typeName就是组件的name
+    // 这里先把原先在构造方法中添加的组件删除掉
+    // 再把通过xml文件中解析来的组件class的instance添加进去
+    mConfigMap.remove(typeName);
+    mConfigMap.put(typeName, new ArrayList<Object>(1));
+    for (Object configObject : configList) {
+        addObject(typeName, configObject);
+    }
+}
+```
+到这里就逻辑就很清晰了：整个框架的工作是通过一系列组件完成的，每次命令的执行都会有一个新的configuration出来，其中包含了所有命令执行需要的组件，但是，在解析xml文件的时候，完成了xml文件的sax解析，将其中配置的组件通过反射的方式动态替换掉了configuration中的添加的默认组件，这样以来，用户组定义了的组件会使用自定义的，没有自定义的就会使用默认的组件，这也就完成了通过自定义xml文件的形式来改变框架的实际工作内容的效果。也就是注入。
+
+大致看下cts.xml文件中的内容：
+``` xml
+<configuration
+    description="Runs a CTS plan from a pre-existing CTS installation">
+
+    <option name="enable-root" value="false" />
+    <build_provider class="com.android.cts.tradefed.build.CtsBuildProvider" />
+    <device_recovery class="com.android.tradefed.device.WaitDeviceRecovery" />
+    <test class="com.android.cts.tradefed.testtype.CtsTest" />
+    <logger class="com.android.tradefed.log.FileLogger" />
+    <result_reporter class="com.android.cts.tradefed.result.CtsXmlResultReporter" />
+    <result_reporter class="com.android.cts.tradefed.result.CtsTestLogReporter" />
+    <result_reporter class="com.android.cts.tradefed.result.IssueReporter" />
+</configuration>
+```
+其中的build_provider，test等标签恰好都在Configuration中有定义，也就验证了前面的分析。
+到这里，一个命令的配置文件就解析完毕了，回到最出addCommand方法的最后
+``` java
+config.validateOptions();
+if (config.getCommandOptions().runOnAllDevices()) {
+    addCommandForAllDevices(totalExecTime, args, cmdFilePath);
+} else {
+    CommandTracker cmdTracker = createCommandTracker(args, cmdFilePath);
+    cmdTracker.incrementExecTime(totalExecTime);
+    ExecutableCommand cmdInstance = createExecutableCommand(cmdTracker, config, false);
+    addExecCommandToQueue(cmdInstance, 0);
+}
+
+private synchronized boolean addExecCommandToQueue(final ExecutableCommand cmd,
+        long delayTime) {
+    if (isShutdown()) {
+        return false;
+    }
+    if (delayTime > 0) {
+        mSleepingCommands.add(cmd);
+        // delay before making command active
+        Runnable delayCommand = new Runnable() {
+            @Override
+            public void run() {
+                synchronized (CommandScheduler.this) {
+                    if (mSleepingCommands.remove(cmd)) {
+                        mReadyCommands.add(cmd);
+                        mCommandProcessWait.signalEventReceived();
+                    }
+                }
+            }
+        };
+        mCommandTimer.schedule(delayCommand, delayTime, TimeUnit.MILLISECONDS);
+    } else {
+        mReadyCommands.add(cmd);
+        mCommandProcessWait.signalEventReceived();
+    }
+    return true;
+}
+```
+在验证了configuration的正确性之后，可以看到是通过configuration创建了CommandTracker对象，然后添加到了前面说过的CommandScheduler的命令队列中，等待被调度。
+
