@@ -1,0 +1,267 @@
+经过了前面对于命令的调度，开启真正命令的执行，在TestInvocation中把configuration中的所有组件都取出来执行。
+入口：TestInvocation.invoke
+```java
+public void invoke(
+        IInvocationContext context, IConfiguration config, IRescheduler rescheduler,
+        ITestInvocationListener... extraListeners)
+                throws DeviceNotAvailableException, Throwable {
+    // 添加监听器，有device状态，log等
+    List<ITestInvocationListener> allListeners =
+            new ArrayList<>(config.getTestInvocationListeners().size() + extraListeners.length);
+    allListeners.addAll(config.getTestInvocationListeners());
+    allListeners.addAll(Arrays.asList(extraListeners));
+    if (config.getProfiler() != null) {
+        allListeners.add(new AggregatingProfilerListener(config.getProfiler()));
+    }
+    // 初始化log监听器
+    ITestInvocationListener listener = new LogSaverResultForwarder(config.getLogSaver(),
+            allListeners);
+    String currentDeviceName = null;
+    try {
+        mStatus = "fetching build";
+        config.getLogOutput().init();
+        getLogRegistry().registerLogger(config.getLogOutput());
+        // 按照前面的分析，命令的执行是以设备为单位的
+        // 这里需要知道所有执行命令的设备，逐个去在设备上执行
+        for (String deviceName : context.getDeviceConfigNames()) {
+            context.getDevice(deviceName).clearLastConnectedWifiNetwork();
+            // 添加命令行参数option
+            context.getDevice(deviceName).setOptions(
+                    config.getDeviceConfigByName(deviceName).getDeviceOptions());
+            if (config.getDeviceConfigByName(deviceName).getDeviceOptions()
+                    .isLogcatCaptureEnabled()) {
+                if (!(context.getDevice(deviceName).getIDevice() instanceof StubDevice)) {
+                    context.getDevice(deviceName).startLogcat();
+                }
+            }
+        }
+        String cmdLineArgs = config.getCommandLine();
+        if (cmdLineArgs != null) {
+            CLog.i("Invocation was started with cmd: %s", cmdLineArgs);
+        }
+        updateInvocationContext(context, config);
+        for (String deviceName : context.getDeviceConfigNames()) {
+            currentDeviceName = deviceName;
+            // 从configuration中取出需要的组件
+            IBuildInfo info = null;
+            ITestDevice device = context.getDevice(deviceName);
+            IDeviceConfiguration deviceConfig = config.getDeviceConfigByName(deviceName);
+            IBuildProvider provider = deviceConfig.getBuildProvider();
+            // Set the provider test tag
+            if (provider instanceof IInvocationContextReceiver) {
+                ((IInvocationContextReceiver)provider).setInvocationContext(context);
+            }
+            // Get the build
+            if (provider instanceof IDeviceBuildProvider) {
+                info = ((IDeviceBuildProvider)provider).getBuild(device);
+            } else {
+                info = provider.getBuild();
+            }
+            if (info != null) {
+                // 执行命令的设备的Serial
+                info.setDeviceSerial(device.getSerialNumber());
+                context.addDeviceBuildInfo(deviceName, info);
+                device.setRecovery(deviceConfig.getDeviceRecovery());
+            } else {
+                mStatus = "(no build to test)";
+                CLog.logAndDisplay(
+                        LogLevel.WARN,
+                        "No build found to test for device: %s",
+                        device.getSerialNumber());
+                rescheduleTest(config, rescheduler);
+                // save current log contents to global log
+                getLogRegistry().dumpToGlobalLog(config.getLogOutput());
+                // Set the exit code to error
+                setExitCode(ExitCode.NO_BUILD,
+                        new BuildRetrievalError("No build found to test."));
+                return;
+            }
+            // TODO: remove build update when reporting is done on context
+            updateBuild(info, config);
+        }
+        if (shardConfig(config, context, rescheduler)) {
+            CLog.i("Invocation for %s has been sharded, rescheduling",
+                    context.getSerials().toString());
+        } else {
+            if (config.getTests() == null || config.getTests().isEmpty()) {
+                CLog.e("No tests to run");
+            } else {
+                // 真正的执行
+                performInvocation(config, context, rescheduler, listener);
+                setExitCode(ExitCode.NO_ERROR, null);
+            }
+        }
+    } catch (BuildRetrievalError e) {
+        ...
+    } finally {
+        ...
+        // 停止继续logcat，保存
+        for (String deviceName : context.getDeviceConfigNames()) {
+            if (!(context.getDevice(deviceName).getIDevice() instanceof StubDevice)) {
+                context.getDevice(deviceName).stopLogcat();
+            }
+        }
+        ...
+    }
+}
+```
+performInvocation
+``` java
+private void performInvocation(IConfiguration config, IInvocationContext context,
+        IRescheduler rescheduler, ITestInvocationListener listener) throws Throwable {
+
+    boolean resumed = false;
+    String bugreportName = null;
+    long startTime = System.currentTimeMillis();
+    long elapsedTime = -1;
+    Throwable exception = null;
+    Throwable tearDownException = null;
+    ITestDevice badDevice = null;
+
+    startInvocation(config, context, listener);
+    try {
+        logDeviceBatteryLevel(context, "initial");
+        // 执行命令
+        prepareAndRun(config, context, listener);
+    } catch (BuildError e) {
+        ...
+    } finally {
+        ...
+        try {
+            // 执行doTeardown清理模板
+            doTeardown(config, context, exception);
+        } catch (Throwable e) {
+            tearDownException = e;
+            if (exception == null) {
+                // only report when the exception is new during tear down
+                reportFailure(tearDownException, listener, config, context, rescheduler);
+            }
+        }
+        // 执行clean以及保存log
+        ... cleanUp
+    if (tearDownException != null) {
+        throw tearDownException;
+    }
+}
+```
+prepareAndRun
+```java
+private void prepareAndRun(
+        IConfiguration config, IInvocationContext context, ITestInvocationListener listener)
+        throws Throwable {
+    getRunUtil().allowInterrupt(true);
+    logDeviceBatteryLevel(context, "initial -> setup");
+    doSetup(config, context, listener);
+    logDeviceBatteryLevel(context, "setup -> test");
+    runTests(context, config, listener);
+    logDeviceBatteryLevel(context, "after test");
+}
+```
+doSetup：因为支持的测试种类很多，通过instanceof关键字去判断需要执行的测试到底是哪种接口的子类，就执行该模板的setup方法。
+``` java
+void doSetup(
+        IConfiguration config,
+        IInvocationContext context,
+        final ITestInvocationListener listener)
+        throws TargetSetupError, BuildError, DeviceNotAvailableException {
+    for (String deviceName : context.getDeviceConfigNames()) {
+        ITestDevice device = context.getDevice(deviceName);
+        if (device instanceof ITestLoggerReceiver) {
+            ((ITestLoggerReceiver) context.getDevice(deviceName))
+                    .setTestLogger(listener);
+        }
+        if (!config.getCommandOptions().shouldSkipPreDeviceSetup()) {
+            device.preInvocationSetup(context.getBuildInfo(deviceName));
+        }
+        for (ITargetPreparer preparer : config.getDeviceConfigByName(deviceName)
+                .getTargetPreparers()) {
+            if (preparer instanceof ITestLoggerReceiver) {
+                ((ITestLoggerReceiver) preparer).setTestLogger(listener);
+            }
+            preparer.setUp(device, context.getBuildInfo(deviceName));
+        }
+    }
+    for (IMultiTargetPreparer multipreparer : config.getMultiTargetPreparers()) {
+        if (multipreparer instanceof ITestLoggerReceiver) {
+            ((ITestLoggerReceiver) multipreparer).setTestLogger(listener);
+        }
+        multipreparer.setUp(context);
+    }
+    if (config.getProfiler() != null) {
+        config.getProfiler().setUp(context);
+    }
+    for (String deviceName : context.getDeviceConfigNames()) {
+        reportLogs(context.getDevice(deviceName), listener, Stage.SETUP);
+    }
+}
+```
+runTests：类似与doSetup，根据不同的情况，看需要执行的测试case到底哪种，进行相应的预处理，最后调用接口的run方法。
+``` java
+private void runTests(IInvocationContext context, IConfiguration config,
+        ITestInvocationListener listener) throws DeviceNotAvailableException {
+    for (IRemoteTest test : config.getTests()) {
+        if (test instanceof IDeviceTest) {
+            ((IDeviceTest)test).setDevice(context.getDevices().get(0));
+        }
+        if (test instanceof IBuildReceiver) {
+            ((IBuildReceiver)test).setBuild(context.getBuildInfo(
+                    context.getDevices().get(0)));
+        }
+        if (test instanceof ISystemStatusCheckerReceiver) {
+            ((ISystemStatusCheckerReceiver) test).setSystemStatusChecker(
+                    config.getSystemStatusCheckers());
+        }
+        if (test instanceof IMultiDeviceTest) {
+            ((IMultiDeviceTest)test).setDeviceInfos(context.getDeviceBuildMap());
+        }
+        if (test instanceof IInvocationContextReceiver) {
+            ((IInvocationContextReceiver)test).setInvocationContext(context);
+        }
+        test.run(listener);
+    }
+}
+```
+doTearDown：执行各种teardown，并进行清理工作
+``` java
+private void doTeardown(IConfiguration config, IInvocationContext context,
+        Throwable exception) throws Throwable {
+    Throwable throwable = null;
+
+    List<IMultiTargetPreparer> multiPreparers = config.getMultiTargetPreparers();
+    ListIterator<IMultiTargetPreparer> iterator =
+            multiPreparers.listIterator(multiPreparers.size());
+    while (iterator.hasPrevious()) {
+        IMultiTargetPreparer multipreparer = iterator.previous();
+        multipreparer.tearDown(context, throwable);
+    }
+    for (String deviceName : context.getDeviceConfigNames()) {
+        ITestDevice device = context.getDevice(deviceName);
+        device.clearLastConnectedWifiNetwork();
+        List<ITargetPreparer> preparers =
+                config.getDeviceConfigByName(deviceName).getTargetPreparers();
+        ListIterator<ITargetPreparer> itr = preparers.listIterator(preparers.size());
+        while (itr.hasPrevious()) {
+            ITargetPreparer preparer = itr.previous();
+            if(preparer instanceof ITargetCleaner) {
+                ITargetCleaner cleaner = (ITargetCleaner) preparer;
+                if (cleaner != null) {
+                    try {
+                        device.getSerialNumber());
+                        cleaner.tearDown(device, context.getBuildInfo(deviceName), exception);
+                    } catch (Throwable e) {
+                        throwable = e;
+                    }
+                }
+            }
+        }
+        device.postInvocationTearDown();
+    }
+    if (throwable != null) {
+        throw throwable;
+    }
+}
+```
+一般测试case都会实现setup，run，teardown，分别在其中做初始化，执行测试以及最后的收尾工作，通过反射的方式都拿到了测试实例，执行模板接口，所以真正执行case的时候只需要复写模板中定义好的方法即可。
+
+
+到这里，基础框架就介绍的差不多了，可以返回去再看下`基础框架启动`中最开始的一张大图，整体的流程从main的启动到最后这部分test的执行的逻辑都在里面，再梳理一遍，下一篇开始介绍在基础框架上封装了一层的`CTS测试框架`。
