@@ -1,0 +1,498 @@
+##目录
+
+- 概述
+- 组织case
+ - CTS框架配置文件
+ - 测试case配置文件
+ - 启动框架CtsConsole
+ - test组件CtsTest
+ - 测试类型
+- 执行命令
+- 总结
+
+##1 概述
+CTS测试框架是有[两个版本](https://source.android.com/compatibility/cts/run)的，Android 6.0以及之前的版本都统称为V1版本，7.0以及之后的版本为V2(目前Android版本已经迭代到Android O了，目前还是用的V2框架)，其实两者都是基于基础框架Trade-Federation进行了封装，定义了case的组织方式，不过两个的解析以及组织方式并不一样。
+前面已经介绍过了基础框架，可以在运行时注入动态替换组件，CTS测试框架的封装正是通过这种方式，指定了自己的组件，在组件中定义了自己的处理逻辑，主要包括plan的解析，case的组织，case的分类等，这里先介绍V1版本的处理方式，下篇文章介绍V2的处理方式。
+##2 组织case
+开始之前首先说明**plan的概念**：执行CTS测试是以plan为单位的，一个plan是一组测试的集合，不同的plan代表着执行不同的集合中的测试case。就像cts这个plan，就代表要执行所有的CTS测试case。
+另外，无论是plan，还是case，包括运行的脚本，都是Google提供的，厂商需要做的就是连接手机，执行命令运行测试生成报告。
+###2.1 CTS框架配置文件
+>文件位置:/cts/tools/tradefed-host/res/config/cts.xml
+
+cts.xml:
+``` xml
+<configuration
+    description="Runs a CTS plan from a pre-existing CTS installation">
+    <option name="enable-root" value="false" />
+    <build_provider class="com.android.cts.tradefed.build.CtsBuildProvider" />
+    <device_recovery class="com.android.tradefed.device.WaitDeviceRecovery" />
+    <test class="com.android.cts.tradefed.testtype.CtsTest" />
+    <logger class="com.android.tradefed.log.FileLogger" />
+    <result_reporter class="com.android.cts.tradefed.result.CtsXmlResultReporter" />
+    <result_reporter class="com.android.cts.tradefed.result.CtsTestLogReporter" />
+    <result_reporter class="com.android.cts.tradefed.result.IssueReporter" />
+</configuration>
+```
+这个文件中定义的就是CTS测试自己定义的组件的实现类，也就是说框架的运行流程不变，运行时替换文件中的组件，其中有`build_provider`，`test`，`logger`等组件的定义，最重要的还是**test组件**，因为按照我们前面的分析，其他组件都是为了辅助测试的运行而存在的，而基础框架执行到最后执行的就是预先写好的模板中的`setup`,`run`,`tearDown`方法，这些方法就是test组件中的方法，所以真正执行的真是test组件，也就是CtsTest.java这个类。
+###2.2 测试case配置文件
+按照前面的说法，CTS测试的执行是以plan为单位的，所以既然CtsTest中定义了case的组织，那就有必要先来看看这个plan究竟长什么样子。
+注：这个文件是Google提供的测试包中的，由于文件中内容很多，所以这里就列举了一小部分，不过也足以说明了。
+``` xml
+<TestPlan version="1.0">
+  <Entry name="android.JobScheduler"/>
+  <Entry name="android.aadb"/>
+  <Entry name="android.acceleration"/>
+  <Entry name="android.accessibility"/>
+  <Entry name="android.accessibilityservice"/>
+  ...
+</TestPlan>
+```
+看起来这个plan文件中好像也没写，就只是列了一堆类似包名的东西。
+其实这个地方的Entry中的name正是它要执行的测试case的appPackageName，可以看下面的`android.JobScheduler`对应的测试case的xml文件：
+``` xml
+<?xml version="1.0" encoding="UTF-8"?>
+<TestPackage appNameSpace="android.jobscheduler.cts.deviceside" appPackageName="android.JobScheduler" name="CtsJobSchedulerDeviceTestCases" runner="android.support.test.runner.AndroidJUnitRunner" runtimeHint="0" version="1.0">
+<TestSuite name="android">
+<TestSuite name="jobscheduler">
+<TestSuite name="cts">
+<TestCase name="ConnectivityConstraintTest">
+<Test name="testAndroidTestCaseSetupProperly" abis="armeabi-v7a, arm64-v8a" />
+</TestCase>
+<TestCase name="TimingConstraintsTest">
+<Test name="testAndroidTestCaseSetupProperly" abis="armeabi-v7a, arm64-v8a" />
+</TestCase>
+</TestSuite>
+</TestSuite>
+</TestSuite>
+</TestPackage> 
+```
+配置文件中的内容更多，这里也只是列了一小部分，说明下结构即可。
+最重要的是其中的Test标签，每个标签代表了一条测试。
+
+还有部分测试会有的config文件，这个后面再说，这里先说下结构：
+``` 
+<configuration description="CTS device admin test config">
+    <include name="common-config" />
+    <option name="run-command:run-command" value="dpm set-active-admin android.deviceadmin.cts/.CtsDeviceAdminReceiver" />
+    <option name="run-command:run-command" value="dpm set-active-admin android.deviceadmin.cts/.CtsDeviceAdminReceiver2" />
+</configuration>
+```
+###2.3 启动框架CtsConsole
+>CTS测试框架代码位置: /cts/tools/tradefed-host/src
+CtsConsole.java位置: /cts/tools/tradefed-host/src/com/android/cts/tradefed/command/CtsConsole.java
+
+这里从名称上就可以看出来，正是CTS测试的入口，它是基础框架中的Console的子类，有兴趣可以去看下这个文件中的内容，这里就不做罗列了。
+其中的内容很很简单，跟Console类中的main一样，这个地方的main创建了一个CtsConsole对象并开启线程，还有一点，因为是自定义，它还复写了父类的setCustomCommands方法，这样就可以添加自己的命令。
+###2.4 test组件CtsTest
+>CtsConsole.java位置: /cts/tools/tradefed-host/src/com/android/cts/tradefed/testtype/CtsTest.java
+
+前面介绍了半天的基础，现在终于进入正戏了，CtsTest这个文件正是test组件，我们也可以看下它类的定义：
+```java
+public class CtsTest implements IDeviceTest, IResumableTest, IShardableTest, IBuildReceiver
+```
+可以看出来，它实现了很多的接口，我们直奔它的run方法即可(方法很长，这里只列出重要的方法)：
+``` java
+public void run(ITestInvocationListener listener) throws DeviceNotAvailableException {
+    ...
+    // 拿到当前设备支持的abi
+    Set<String> abiSet = getAbis();
+    ...
+    // 这个方法虽然看起来只有一行，但是完成了case的组织
+    setupTestPackageList(abiSet);
+    ...
+    // 获取需要在执行测试需要安装的apk
+    Map<String, Set<String>> prerequisiteApks = getPrerequisiteApks(mTestPackageList, abiSet);
+    Collection<String> uninstallPackages = getPrerequisitePackageNames(mTestPackageList);
+
+    try {
+        // 这一步是收集设备信息，所有的测试case在执行之前都需要
+        collectDeviceInfo(getDevice(), mCtsBuild, listener);
+        // prepare containers to hold test metric report logs.
+        prepareReportLogContainers(getDevice(), mBuildInfo);
+        preRebootIfNecessary(mTestPackageList);
+
+        mPrevRebootTime = System.currentTimeMillis();
+        int remainingPackageCount = mTestPackageList.size();
+        IAbi currentAbi = null;
+        // 此时已经拿到了所有的要执行的测试package，遍历
+        // 执行一些测试之前的预准备
+        for (int i = mLastTestPackageIndex; i < mTestPackageList.size(); i++) {
+            TestPackage testPackage = mTestPackageList.get(i);
+            if (currentAbi == null ||
+                !currentAbi.getName().equals(testPackage.getAbi().getName())) {
+                currentAbi = testPackage.getAbi();
+                installPrerequisiteApks(
+                    prerequisiteApks.get(currentAbi.getName()), currentAbi);
+            }
+            IRemoteTest test = testPackage.getTestForPackage();
+            // 这里就是从pkg中取出test，看它是哪种接口，就执行相应的接口方法
+            // 其实就是看测试类型
+            if (test instanceof IBuildReceiver) {
+                ((IBuildReceiver) test).setBuild(mBuildInfo);
+            }
+            if (test instanceof IDeviceTest) {
+                ((IDeviceTest) test).setDevice(getDevice());
+            }
+            if (test instanceof DeqpTestRunner) {
+                ((DeqpTestRunner)test).setCollectLogs(mCollectDeqpLogs);
+            }
+            if (test instanceof GeeTest) {
+                if (!mPositiveFilters.isEmpty()) {
+                    String positivePatterns = join(mPositiveFilters, ":");
+                    ((GeeTest)test).setPositiveFilters(positivePatterns);
+                }
+                if (!mNegativeFilters.isEmpty()) {
+                    String negativePatterns = join(mNegativeFilters, ":");
+                    ((GeeTest)test).setPositiveFilters(negativePatterns);
+                }
+            }
+            // InstrumentationTest，大多数测试都是这个类型
+            // 应该很多人都不陌生
+            if (test instanceof InstrumentationTest) {
+                if (!mPositiveFilters.isEmpty()) {
+                    String annotation = join(mPositiveFilters, ",");
+                    ((InstrumentationTest)test).addInstrumentationArg(
+                            "annotation", annotation);
+                }
+                if (!mNegativeFilters.isEmpty()) {
+                    String notAnnotation = join(mNegativeFilters, ",");
+                    ((InstrumentationTest)test).addInstrumentationArg(
+                            "notAnnotation", notAnnotation);
+                }
+            }
+            forwardPackageDetails(testPackage.getPackageDef(), listener);
+            try {
+                // 重点在这里，执行测试setup,run,teardown
+                performPackagePrepareSetup(testPackage.getPackageDef());
+                test.run(filterMap.get(testPackage.getPackageDef().getId()));
+                performPackagePreparerTearDown(testPackage.getPackageDef());
+            } catch (DeviceUnresponsiveException due) {
+                // 出异常之后printStackTrace方便分析问题
+                ByteArrayOutputStream stack = new ByteArrayOutputStream();
+                due.printStackTrace(new PrintWriter(stack, true));
+                try {
+                    stack.close();
+                } catch (IOException ioe) {
+                }
+                ...
+            }
+            if (!mSkipConnectivityCheck) {
+                MonitoringUtils.checkDeviceConnectivity(getDevice(), listener,
+                        String.format("%s-%s", testPackage.getPackageDef().getName(),
+                                testPackage.getPackageDef().getAbi().getName()));
+            }
+            if (i < mTestPackageList.size() - 1) {
+                TestPackage nextPackage = mTestPackageList.get(i + 1);
+                rebootIfNecessary(testPackage, nextPackage);
+                changeToHomeScreen();
+            }
+            mLastTestPackageIndex = i;
+        }
+        if (mScreenshot) {
+            // 截图
+            InputStreamSource screenshotSource = getDevice().getScreenshot();
+            try {
+                listener.testLog("screenshot", LogDataType.PNG, screenshotSource);
+            } finally {
+                screenshotSource.cancel();
+            }
+        }
+        // 卸载之前预先安装上去的apk
+        uninstallPrequisiteApks(uninstallPackages);
+        // 收集log信息
+        collectReportLogs(getDevice(), mBuildInfo);
+    } catch (RuntimeException e) {
+        CLog.e(e);
+        throw e;
+    } catch (Error e) {
+        CLog.e(e);
+        throw e;
+    } finally {
+        for (ResultFilter filter : filterMap.values()) {
+            filter.reportUnexecutedTests();
+        }
+    }
+}
+```
+####2.4.1 getAbis
+去获取手机中的"ro.product.cpu.abilist"这个property：
+找了个手机测试了下：`[ro.product.cpu.abilist]: [arm64-v8a,armeabi-v7a,armeabi]`
+``` java
+Set<String> getAbis() throws DeviceNotAvailableException {
+    String bitness = (mForceAbi == null) ? "" : mForceAbi;
+    Set<String> abis = new HashSet<>();
+    for (String abi : AbiFormatter.getSupportedAbis(mDevice, bitness)) {
+        if (AbiUtils.isAbiSupportedByCompatibility(abi)) {
+            abis.add(abi);
+        }
+    }
+    return abis;
+}
+
+private static final String PRODUCT_CPU_ABILIST_KEY = "ro.product.cpu.abilist";
+private static final String PRODUCT_CPU_ABI_KEY = "ro.product.cpu.abi";
+
+public static String[] getSupportedAbis(ITestDevice device, String bitness)
+        throws DeviceNotAvailableException {
+    // 获取property
+    String abiList = device.getProperty(PRODUCT_CPU_ABILIST_KEY + bitness);
+    if (abiList != null && !abiList.isEmpty()) {
+        String []abis = abiList.split(",");
+        if (abis.length > 0) {
+             return abis;
+         }
+     }
+     // fallback plan for before lmp, the bitness is ignored
+     return new String[]{device.getProperty(PRODUCT_CPU_ABI_KEY)};
+ }
+```
+####2.4.2 setupTestPackageList
+``` java
+private void setupTestPackageList(Set<String> abis) throws DeviceNotAvailableException {
+    try {
+        // 这行代码中解析了plan文件
+        // 并拿到了配置文件中的所有的package
+        // 又对所有的package进行了xml解析封装成对象
+        ITestPackageRepo testRepo = createTestCaseRepo();
+        List<ITestPackageDef> testPkgDefs = new ArrayList<>(getAvailableTestPackages(testRepo));
+        testPkgDefs = filterByAbi(testPkgDefs, abis);
+        Collections.sort(testPkgDefs);
+        // 前面xml解析后封装成的TestPackageDef，转变为test
+        List<TestPackage> testPackageList = new ArrayList<>();
+        for (ITestPackageDef testPackageDef : testPkgDefs) {
+            IRemoteTest testForPackage = testPackageDef.createTest(mCtsBuild.getTestCasesDir());
+            if (testPackageDef.getTests().size() > 0) {
+                testPackageList.add(new TestPackage(testPackageDef, testForPackage));
+            }
+        }
+        ...
+    }
+}
+```
+#### 2.4.3 createTestCaseRepo
+``` java
+ITestPackageRepo createTestCaseRepo() {
+    return new TestPackageRepo(mCtsBuild.getTestCasesDir(), mIncludeKnownFailures);
+}
+public TestPackageRepo(File testCaseDir, boolean includeKnownFailures) {
+    mTestMap = new HashMap<>();
+    mIncludeKnownFailures = includeKnownFailures;
+    // 重点在这里，也就是说在TestCaseRepo创建的时候
+    // 就已经把testDir已经解析完毕了
+    // 已经把所有的xml中配置的测试case都装进内存了
+    parse(testCaseDir);
+}
+```
+parse中对测试目录的所有的`.xml`文件进行了遍历，并对每个xml文件进行解析以及封装：
+``` java
+private void parseModuleTestConfigs(File xmlFile)  {
+    TestPackageXmlParser parser = new TestPackageXmlParser(mIncludeKnownFailures);
+    try {
+        // 这个都不陌生了，sax解析
+        // 具体的解析逻辑在TestPackageXmlParser中
+        parser.parse(createStreamFromFile(xmlFile));
+        // 对这个xml同名称的.config文件解析
+        // 如果存在的话，会把其中配置的内容拿出来，在执行这条测试之前执行
+        // 大部分是执行这条测试需要预先执行的命令
+        File preparer = getPreparerDefForPackage(xmlFile);
+        IConfiguration config = null;
+        if (preparer != null) {
+            try {
+                config = ConfigurationFactory.getInstance().createConfigurationFromArgs(
+                        new String[]{preparer.getAbsolutePath()});
+            } catch (ConfigurationException e) {
+                throw new RuntimeException(
+                        String.format("error parsing config file: %s", xmlFile.getName()), e);
+            }
+        }
+        // 拿到在这个xml文件中解析出来的要执行的TestPackageDef
+        // 一个TestPackageDef就是上面的一个xml文件
+        Set<TestPackageDef> defs = parser.getTestPackageDefs();
+        if (defs.isEmpty()) {
+            Log.w(LOG_TAG, String.format("Could not find test package info in xml file %s",
+                    xmlFile.getAbsolutePath()));
+        }
+        for (TestPackageDef def : defs) {
+            String name = def.getAppPackageName();
+            String abi = def.getAbi().getName();
+            if (config != null) {
+                // 把config文件中需要执行的prepare操作记录下来
+                def.setPackagePreparers(config.getTargetPreparers());
+            }
+            // mTestMap是一个全局的大map
+            // 一级key是abi，二级key是测试的packageName，value是TestPackageDef对象
+            if (!mTestMap.containsKey(abi)) {
+                mTestMap.put(abi, new HashMap<String, TestPackageDef>());
+            }
+            // 放入全局map
+            mTestMap.get(abi).put(name, def);
+        }
+    } catch (FileNotFoundException e) {
+        Log.e(LOG_TAG, String.format("Could not find test case xml file %s",
+                xmlFile.getAbsolutePath()));
+        Log.e(LOG_TAG, e);
+    } catch (ParseException e) {
+        Log.e(LOG_TAG, String.format("Failed to parse test case xml file %s",
+                xmlFile.getAbsolutePath()));
+        Log.e(LOG_TAG, e);
+    }
+}
+```
+经过了这一步，我们可以总结出来：在createTestCaseRepo一步中：
+
+ - 创建了TestCaseRepo
+ - 对测试case所在的目录中所有的配置文件进行了xml解析
+ - 每个xml文件中的Test标签都代表一条测试，每个xml文件对应一个TestPackageDef
+ - 对需要prepare操作的package还进行了config的解析
+ - 把所有的xml文件解析完毕之后，放到了一个二级全局map中
+ - 不同的abi执行的测试完全是两个集合
+
+####2.4.4 getAvailableTestPackages
+经过前面一步，已经拿到了所有的测试package的集合。
+getAvailableTestPackages中的方法很长，这里只说明一下比较重要的部分：
+``` java
+Set<ITestPackageDef> testPkgDefs = new LinkedHashSet<>();
+if (mPlanName != null) {
+    // 拿到plan文件
+    File ctsPlanFile = mCtsBuild.getTestPlanFile(mPlanName);
+    ITestPlan plan = createPlan(mPlanName);
+    // 又是xml文件的解析，不过这次是plan文件
+    plan.parse(createXmlStream(ctsPlanFile));
+    // 这个testId是abi以及packagename拼接的字符串
+    // 分开之后就可以去上面的全局map获取testPackageDef
+    for (String testId : plan.getTestIds()) {
+        if (mExcludedPackageNames.contains(AbiUtils.parseTestName(testId))) {
+            continue;
+        }
+        ITestPackageDef testPackageDef = testRepo.getTestPackage(testId);
+        if (testPackageDef == null) {
+            continue;
+        }
+        // 去上面的全局测试package中获取
+        testPackageDef.setTestFilter(plan.getTestFilter(testId));
+        // 把这个plan中所有需要执行的测试testPackageDef取出来
+        testPkgDefs.add(testPackageDef);
+    }
+}
+```
+前面既然已经拿到了所有的可执行的测试case的全局map，这个地方就是根据测试的plan，根据plan中配置的packageName以及abi去全局map中获取这个plan中需要执行的测试case，然后组成一个list。
+
+**小结**：上面分析了这么多，在CtsTest的run方法中其实就是一行代码`setupTestPackageList(abiSet);`经过了这行代码，已经测试目录下所有配置的xml文件解析完毕，并且根据本次测试的plan文件拿到了这个plan中要执行的测试case的list。
+
+可能大脑堆栈有点深了，现在再回到run方法中继续：
+####2.4.5 runTest
+run方法中虽然还有一些其他的方法，但基本都是针对测试之前的预处理了，包括`getPrerequisiteApks`，`collectDeviceInfo`，`prepareReportLogContainers`等，这里就不一一列出其实现了，有兴趣可以自己去看，最重要的测试case的组织已经介绍过了。
+``` java
+performPackagePrepareSetup(testPackage.getPackageDef());
+test.run(filterMap.get(testPackage.getPackageDef().getId()));
+performPackagePreparerTearDown(testPackage.getPackageDef());
+```
+这里就是测试case了，也就是说CTS测试框架在基础框架的基础上进行了一系列的封装，在test组件中做的就是把测试case组织了以下以及plan的生成，最终还是又提供了测试模板方法。
+###2.5 测试类型
+测试case有很多种类型，因此在上面的配置文件封装成对象之后还有最重要的一步就是：`TestPackageDef.createTest`。
+这里不列代码了，主要说明下测试类型：
+测试一共有八种类型：
+>hostSideOnly：主要在主机端完成，测试代码通过jar包的方式提供，通过反射调用，测试内容主要是可以通过adb命令直接完成，比如install或push文件等。
+native：测试包中推提供可运行文件，名称是测试的包名，测试时先将可执行文件push到手机上，然后赋予权限并执行。
+wrappednative：目前只有一个opengl的测试是这个类型，是通过instrument来执行测试的，先安装apk，然后"am instrument -w xxx"命令来执行测试。
+vmHostTest：这个类型目前也只有android.core.vm-tests-tf这一个测试，也是通过jar包的方式提供case，然后push到手机中通过junit测试。
+deqpTest：通过am instrument来执行
+uiAutomator：目前只有CtsUiAutomatorTests是这种方式，先将jar包推送到手机中然后通过am instrument的方式运行测试。
+jUnitDeviceTest：目前只有CtsJdwp这个使用这个，也是通过jar包的方式提供，然后在手机中运行运行jar包。
+CtsInstrumentationApkTest（默认测试类型）：先安装apk，然后instrument来调用测试case。
+##3 执行测试
+上面已经说明了详细的测试种类，大致执行方式上面也已经列出了。
+对于hostside以及clientTest两种其实都需要手机与PC之前的通信，那么具体的通信细节是怎么实现的呢？
+这就全靠我们都常用却忽视的一个jar包：ddmslib。可以去Google网站下下载源码，也可以直接反编译现有的jar包。
+个人也没有研究太多，这里先列一些主要代码的实现逻辑，后面再详细研究：
+原理就是直接通过socket跟adbd通信
+`AndroidDebugBridge`
+``` java
+// Where to find the ADB bridge.
+static final String ADB_HOST = "127.0.0.1";
+static final int ADB_PORT = 5037;
+
+private static void initAdbSocketAddr() {
+    try {
+        int adb_port = determineAndValidateAdbPort();
+        sHostAddr = InetAddress.getByName(ADB_HOST);
+        sSocketAddr = new InetSocketAddress(sHostAddr, adb_port);
+    } catch (UnknownHostException e) {
+        // localhost should always be known.
+    }
+}
+```
+提供命令的执行的封装：`AdbHelper`
+``` java
+static void executeRemoteCommand(InetSocketAddress adbSockAddr,
+    String command, IDevice device, IShellOutputReceiver rcvr, long maxTimeToOutputResponse,
+    TimeUnit maxTimeUnits) throws TimeoutException, AdbCommandRejectedException,
+    ShellCommandUnresponsiveException, IOException {
+    ...
+    SocketChannel adbChan = null;
+    try {
+        adbChan = SocketChannel.open(adbSockAddr);
+        adbChan.configureBlocking(false);
+
+        // if the device is not -1, then we first tell adb we're looking to
+        // talk
+        // to a specific device
+        setDevice(adbChan, device);
+        byte[] request = formAdbRequest("shell:" + command); 
+        write(adbChan, request);
+        // 写入要执行的命令请求
+        write(adbChan, request);
+        AdbResponse resp = readAdbResponse(adbChan, false /* readDiagString */);
+        if (!resp.okay) {
+            Log.e("ddms", "ADB rejected shell command (" + command + "): " + resp.message);
+            throw new AdbCommandRejectedException(resp.message);
+        }
+        byte[] data = new byte[16384];
+        ByteBuffer buf = ByteBuffer.wrap(data);
+        long timeToResponseCount = 0;
+        while (true) {
+            int count;
+            if (rcvr != null && rcvr.isCancelled()) {
+                Log.v("ddms", "execute: cancelled");
+                break;
+            }
+            // 读取数据
+            count = adbChan.read(buf);
+            if (count < 0) {
+                // we're at the end, we flush the output
+                rcvr.flush();
+                        + count);
+                break;
+            } else if (count == 0) {
+                try {
+                    int wait = WAIT_TIME * 5;
+                    timeToResponseCount += wait;
+                    if (maxTimeToOutputMs > 0 && timeToResponseCount > maxTimeToOutputMs) {
+                        throw new ShellCommandUnresponsiveException();
+                    }
+                    Thread.sleep(wait);
+                } catch (InterruptedException ie) {
+                }
+            } else {
+                timeToResponseCount = 0;
+                // send data to receiver if present
+                if (rcvr != null) {
+                    rcvr.addOutput(buf.array(), buf.arrayOffset(), buf.position());
+                }
+                buf.rewind();
+            }
+        }
+    } finally {
+        if (adbChan != null) {
+            adbChan.close();
+        }
+        Log.v("ddms", "execute: returning");
+    }
+}
+```
+只要是PC跟Android设备之间的通信，基本都是基于adb的，前面提到的各种测试的基础都是跟adbd之间的socket通信完成的。
+##总结
+CTS测试框架在基础框架的基础上虽然修改的东西还是不少，但是可以看出来其实还是组件中内容的自定义，整体的基础框架的执行流程并没有变化。最重要的就是其中对于case的组织，提供各种xml文件以及plan去组织case。能把几十万条case都组织起来，说明这个框架也确实强大，但是缺点也很明显，随着测试Android的不断迭代，case越来越多，不仅仅是plan需要修改，xml文件也需要不断的增加，维护起来工作量会越来越大。因此就有了更加好用的V2版本。
+
+下篇文章介绍V2版本。
+
