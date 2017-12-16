@@ -1,0 +1,190 @@
+概述：前面已经提到，基础框架Trade-Federation默认就支持很多命令。在控制台输入一组命令，肯定要经过解析，然后去执行的过程。基础框架中对于命令有一个单独的数据结构去组织，并不是通过if-else这样去比较string的。比如：前面提到的命令：`run cts --plan cts`，这个命令中，run才是命令，而剩下的都属于参数；再比如：`list configs`，还有命令的简写，`list`可以简写为`l`等等。
+
+###1.Trie
+Trie树又称为字典树，又叫做单词查找树。主要用于文本检索以及词频统计等。有一个很大的优点就是能够减少无效匹配的次数。
+实现方式：从root节点开始，每个节点存储一个字符。每次在向树中存储字符串的时候，根据单词中字符的顺序，逐个向树的每层去存放，如果该层已经有该字符，就去取下一个字符。
+例：现在有一些单词：t,tx,txt,to,txa,too,a,b
+构建成为字典树如图所示
+![这里写图片描述](http://img.blog.csdn.net/20171216142435405?watermark/2/text/aHR0cDovL2Jsb2cuY3Nkbi5uZXQvdTAxMTczMzg2OQ==/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70/gravity/SouthEast)
+看这个图就能一目了然，因为共前缀，能够加快查找效率，且查找以及构建的过程可以同时进行。
+
+###2.RegexTrie
+RegexTrie是在这个基础框架中的一个工具类，实现跟上面的Trie很像，但是还是有区别的：区别就在于RegexTrie的节点上存放的是**正则表达式**,也就是支持的命令的正则表达式。
+基础框架中支持两种命令：定长命令以及变长命令。
+定长命令：`list configs` -- 固定的字符串(包括简写)
+变长命令：`run cts --plan cts` -- 后带变长参数
+
+树的结构：
+![这里写图片描述](http://img.blog.csdn.net/20171216144900812?watermark/2/text/aHR0cDovL2Jsb2cuY3Nkbi5uZXQvdTAxMTczMzg2OQ==/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70/gravity/SouthEast)
+
+
+接下来看下实现：
+首先是这个类中的变量:
+``` java
+private V mValue = null;
+private Map<CompPattern, RegexTrie<V>> mChildren = new LinkedHashMap<CompPattern, RegexTrie<V>>();
+
+```
+####2.1 put
+``` java
+public V put(V value, String... regexen) {
+    // 这个地方直接就把输入的正则表达式的参数解析封装为CompPattern
+    // CompPattern内部有一个Pattern变量，不过自己还实现了一些Object中的方法
+    List<CompPattern> pList = new ArrayList<CompPattern>(regexen.length);
+    for (String regex : regexen) {
+        // 这个地方需要注意，因为参数是变长的，这里如果发现了null
+        // 也把null添加进了数组，而且跳出了循环
+        // 主要是为了支持变长命令，变长命令在存储的时候最后一个的参数为null
+        if (regex == null) {
+            pList.add(null);
+            break;
+        }
+        Pattern pat = Pattern.compile(regex);
+        // 把所有的正则表达式装进List，准备往树中存放
+        pList.add(new CompPattern(pat));
+    }
+    return validateAndPut(value, pList);
+}
+
+private V validateAndPut(V value, List<CompPattern> pList) {
+    if (pList.size() == 0) {
+        throw new IllegalArgumentException("pattern list must be non-empty.");
+    }
+    return recursivePut(value, pList);
+}
+
+V recursivePut(V value, List<CompPattern> patterns) {
+    // Cases:
+    // 1) patterns is empty -- set our value
+    // 2) patterns is non-empty -- recurse downward, creating a child if necessary
+    if (patterns.isEmpty()) {
+        // 如果前面封装的list中已经没有元素了，则把对应的value存放到V上
+        V oldValue = mValue;
+        mValue = value;
+        return oldValue;
+    } else {
+        // 每次取出数组中的第一个元素
+        CompPattern curKey = patterns.get(0);
+        List<CompPattern> nextKeys = patterns.subList(1, patterns.size());
+
+        // 只要数组中的元素没有取完，就递归继续
+        RegexTrie<V> nextChild = mChildren.get(curKey);
+        if (nextChild == null) {
+            nextChild = new RegexTrie<V>();
+            // 树的构建
+            mChildren.put(curKey, nextChild);
+        }
+        return nextChild.recursivePut(value, nextKeys);
+    }
+}
+```
+这个就是树的构建，使用就在`Console`类中：
+首先是定长命令：
+``` java
+trie.put(new Runnable() {
+            @Override
+            public void run() {
+                IDeviceManager manager =
+                        GlobalConfiguration.getDeviceManagerInstance();
+                manager.displayDevicesInfo(new PrintWriter(System.out, true));
+            }
+        }, LIST_PATTERN, "d(?:evices)?");
+```
+可见在存放的时候就把是以正则表达式做为参数。
+然后是变长命令：
+``` java 
+ArgRunnable<CaptureList> runRunCommand = new ArgRunnable<CaptureList>() {
+    @Override
+    public void run(CaptureList args) {
+        // The second argument "command" may also be missing, if the
+        // caller used the shortcut.
+        int startIdx = 1;
+        if (args.get(1).isEmpty()) {
+            // Empty array (that is, not even containing an empty string) means that
+            // we matched and skipped /(?:singleC|c)ommand/
+            startIdx = 2;
+        }
+        String[] flatArgs = new String[args.size() - startIdx];
+        for (int i = startIdx; i < args.size(); i++) {
+            flatArgs[i - startIdx] = args.get(i).get(0);
+        }
+        try {
+            mScheduler.addCommand(flatArgs);
+        } catch (ConfigurationException e) {
+            printLine("Failed to run command: " + e.toString());
+        }
+    }
+};
+// 可以看到对于run这个正则表达式，因为这个命令就是为了执行的，肯定是要带参数的，因此，往树中存放的时候最后一参数为null
+// 上面put时对于null的判断也就是为了处理这种情况
+// 这个地方存放的时候存入的V直接就是一个runnable对象了
+trie.put(runRunCommand, RUN_PATTERN, null);
+protected static final String RUN_PATTERN = "r(?:un)?";
+```
+####2.2retrieve
+``` java
+public V retrieve(List<List<String>> captures, String... strings) {
+    if (strings.length == 0) {
+        throw new IllegalArgumentException("string list must be non-empty");
+    }
+    // 在取的时候就是根据控制台的输入了，同样是变长参数
+    List<String> sList = Arrays.asList(strings);
+    if (captures != null) {
+        captures.clear();
+    }
+    return recursiveRetrieve(captures, sList);
+}
+// 递归匹配
+V recursiveRetrieve(List<List<String>> captures, List<String> strings) {
+    if (strings.isEmpty()) {
+        // 如果参数数组已经全部取出，则取出其对应的V
+        return mValue;
+    } else {
+        boolean wildcardMatch = false;
+        V wildcardValue = null;
+        // 每次拿出数组的第一个元素
+        String curKey = strings.get(0);
+        List<String> nextKeys = strings.subList(1, strings.size());
+        // 根据参数取出对应的子树
+        for (Map.Entry<CompPattern, RegexTrie<V>> child : mChildren.entrySet()) {
+            CompPattern pattern = child.getKey();
+            if (pattern == null) {
+                // 如果发现pattern为null，也就是说存的时候就是变长模式，则启用统配
+                wildcardMatch = true;
+                wildcardValue = child.getValue().getValue();
+                continue;
+            }
+            Matcher matcher = pattern.matcher(curKey);
+            // 正则表达式match
+            if (matcher.matches()) {
+                if (captures != null) {
+                    List<String> curCaptures = new ArrayList<String>(matcher.groupCount());
+                    for (int i = 0; i < matcher.groupCount(); i++) {
+                        // i+1 since group 0 is the entire matched string
+                        curCaptures.add(matcher.group(i+1));
+                    }
+                    captures.add(curCaptures);
+                }
+                // 递归
+                return child.getValue().recursiveRetrieve(captures, nextKeys);
+            }
+        }
+        // 如果是统配模式，则返回所有的剩余参数
+        if (wildcardMatch) {
+            // Stick the rest of the query string into the captures list and return
+            if (captures != null) {
+                for (String str : strings) {
+                    captures.add(Arrays.asList(str));
+                }
+            }
+            return wildcardValue;
+        }
+        return null;
+    }
+}
+```
+可以看到在取的时候正式根据参数的list逐个去和树中每个节点上的正则表达式进行match，如果可以匹配则进入子树继续，直到参数取完，此时拿出对应的V。
+###3.总结
+基础框架中通过这样一个正则表达式字典树的结构，在初始化的时候就把自己支持的命令以及这个命令要执行的action -- Runnable对象存进了树，在用户输入参数之后直接去树中取，可以说是取值以及匹配同时进行，直道拿到对应的Runnable对象，取出执行。
+虽然这样对于命令的支持很到位，但是这样的数据结构也优缺点，就是对于数据量小的话支持比较到位，但是当数据量很大，那这个树就会很大，效率也就没有那么高了。
+
