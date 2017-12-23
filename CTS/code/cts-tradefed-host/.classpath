@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<classpath>
+	<classpathentry kind="con" path="org.eclipse.jdt.launching.JRE_CONTAINER"/>
+	<classpathentry kind="lib" path="hosttestlib.jar"/>
+	<classpathentry kind="lib" path="tradefed-prebuilt.jar" sourcepath="/tradefederation"/>
+	<classpathentry kind="lib" path="ctsdeviceinfolib.jar"/>
+	<classpathentry kind="lib" path="cts-commonlib.jar"/>
+	<classpathentry kind="src" path="src"/>
+	<classpathentry kind="src" path="commonutil-src"/>
+	<classpathentry kind="src" path="res"/>
+	<classpathentry combineaccessrules="false" kind="src" path="/tradefederation"/>
+	<classpathentry kind="output" path="bin"/>
+</classpath>
