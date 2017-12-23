@@ -1,0 +1,30 @@
+apply plugin: 'java'
+apply plugin: 'distrib'
+
+group = 'com.android.tools.ddms'
+archivesBaseName = 'ddmlib'
+
+dependencies {
+    compile project(':common')
+
+    compile 'net.sf.kxml:kxml2:2.3.0'
+
+    testCompile 'org.easymock:easymock:3.1'
+    testCompile 'junit:junit:3.8.1'
+}
+
+sourceSets {
+    main.resources.srcDir 'src/main/java'
+    test.resources.srcDir 'src/test/java'
+}
+
+jar {
+    from 'NOTICE'
+}
+
+project.ext.pomName = 'Android Tools ddmlib'
+project.ext.pomDesc = 'Library providing APIs to talk to Android devices'
+
+apply from: '../baseVersion.gradle'
+apply from: '../publish.gradle'
+apply from: '../javadoc.gradle'
